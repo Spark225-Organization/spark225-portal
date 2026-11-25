@@ -1,6 +1,6 @@
 // Google: correo (solo lectura) y agenda de hoy, con el permiso que da Google al entrar.
 // Las transcripciones de juntas (notas de Gemini, Plaud, etc.) se vuelven minuta para todo el equipo.
-import { obtenerTokenGoogle } from './nube.js?v=202611251720';
+import { obtenerTokenGoogle } from './nube.js?v=202611252100';
 
 const API = 'https://gmail.googleapis.com/gmail/v1/users/me';
 const ES_TRANSCRIPCION = /(notas?\b.*(reuni|junta|meeting)|transcrip|minuta|meeting notes|notes by gemini|resumen de la reuni)/i;
@@ -25,8 +25,13 @@ const nombreDe = (from) => (from.match(/^"?([^"<]+?)"?\s*</)?.[1] || from.replac
 
 // Últimos correos de la bandeja. Marca cuáles son transcripciones de juntas.
 export async function correosRecientes(clientes, max = 8) {
-  const lista = await pedir(`${API}/messages?maxResults=${max}&q=${encodeURIComponent('in:inbox newer_than:14d')}`);
-  const msgs = await Promise.all((lista.messages || []).map((m) => pedir(`${API}/messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`)));
+  // Bandeja reciente + búsqueda aparte de notas de juntas (para que no queden enterradas entre muchos correos).
+  const [lista, notas] = await Promise.all([
+    pedir(`${API}/messages?maxResults=${max}&q=${encodeURIComponent('in:inbox newer_than:14d')}`),
+    pedir(`${API}/messages?maxResults=5&q=${encodeURIComponent('newer_than:1d (from:gemini-notes@google.com OR subject:(notas reunión) OR subject:(notes meeting))')}`).catch(() => ({})),
+  ]);
+  const ids = [...new Map([...(lista.messages || []), ...(notas.messages || [])].map((m) => [m.id, m])).values()];
+  const msgs = await Promise.all(ids.map((m) => pedir(`${API}/messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`)));
   return msgs.map((m) => {
     const de = encabezado(m, 'From'), asunto = encabezado(m, 'Subject') || '(sin asunto)';
     const texto = (de + ' ' + asunto).toLowerCase();
@@ -38,7 +43,7 @@ export async function correosRecientes(clientes, max = 8) {
       tipo: REMITENTES_NOTAS.test(de) || ES_TRANSCRIPCION.test(asunto) ? 'transcripcion' : 'correo',
       url: `https://mail.google.com/mail/u/0/#inbox/${m.threadId}`,
     };
-  });
+  }).sort((a, b) => b.cuando.localeCompare(a.cuando));
 }
 
 function decodificar(b64) {
@@ -86,6 +91,27 @@ export async function leerTranscripcion(correo, personas, yo) {
     }
   }
   return { resumen: resumen || correo.asunto, acuerdos };
+}
+
+// Juntas por aceptar: invitaciones de alguien de Spark225 (próximos 14 días) que aún no respondes.
+// Se pregunta al calendario, no al asunto del correo: al aceptarla, desaparece sola.
+export async function juntasPorAceptar(personas = []) {
+  const ini = new Date();
+  const fin = new Date(ini); fin.setDate(fin.getDate() + 14);
+  const r = await pedir(`https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&timeMin=${ini.toISOString()}&timeMax=${fin.toISOString()}&maxResults=60`);
+  return (r.items || []).filter((e) => {
+    if (e.status === 'cancelled' || e.organizer?.self) return false;
+    const yo = (e.attendees || []).find((a) => a.self);
+    const quien = (e.organizer?.email || e.creator?.email || '').toLowerCase();
+    return yo?.responseStatus === 'needsAction' && quien.endsWith('@spark225.com');
+  }).map((e) => {
+    const correo = (e.organizer?.email || e.creator?.email || '').toLowerCase();
+    const p = personas.find((x) => (x.email || '').toLowerCase() === correo);
+    return {
+      id: 'inv-' + e.id, titulo: e.summary || '(sin título)', de: p?.corto || e.organizer?.displayName || correo.split('@')[0],
+      inicio: e.start?.dateTime || e.start?.date, todoElDia: !e.start?.dateTime, url: e.htmlLink,
+    };
+  });
 }
 
 // Agenda de hoy del calendario principal.
